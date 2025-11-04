@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-API_PORT=${MOCK_API_PORT:-6000}
+API_PORT=${MOCK_API_PORT:-5000}
 echo "Checking mock_api..."
 curl -sf "http://localhost:${API_PORT}/health" || { echo "mock_api down"; exit 1; }
 echo "mock_api OK"

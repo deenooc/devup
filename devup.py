@@ -2,27 +2,33 @@
 import os
 import subprocess
 import sys
-from shutil import copyfile
-
+import shutil
 import click
 import requests
-from dotenv import dotenv_values, set_key, load_dotenv
+from dotenv import load_dotenv
 
 ROOT = os.path.dirname(__file__)
-ENV_EXAMPLE = os.path.join(ROOT, ".env.example")
 ENV_FILE = os.path.join(ROOT, ".env")
-DOCKER_COMPOSE_CMD = os.environ.get("DOCKER_COMPOSE", "docker-compose")
+ENV_EXAMPLE = os.path.join(ROOT, ".env.example")
+DOCKER_COMPOSE = os.environ.get("DOCKER_COMPOSE", "docker-compose")
 
 
 def run(cmd, check=True):
-    print(f"$ {' '.join(cmd)}")
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, text=True)
-    print(proc.stdout)
+    proc = subprocess.run(cmd, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    click.echo(proc.stdout)
     if check and proc.returncode != 0:
-        raise RuntimeError(
-            f"Command {' '.join(cmd)} failed with {proc.returncode}")
+        raise click.ClickException(f"Command {' '.join(cmd)} failed")
     return proc
+
+
+def ensure_env():
+    if not os.path.exists(ENV_FILE):
+        raise click.ClickException(
+            ".env not found. Run `./devup.py init` first.")
+    load_dotenv(ENV_FILE)
+
+# ---------------- CLI ----------------
 
 
 @click.group()
@@ -33,48 +39,44 @@ def cli():
 
 @cli.command()
 def init():
-    """Create .env from .env.example and fill defaults if missing."""
+    """Create .env from .env.example."""
     if not os.path.exists(ENV_EXAMPLE):
-        click.echo(".env.example not found")
-        sys.exit(1)
+        raise click.ClickException(".env.example missing.")
     if os.path.exists(ENV_FILE):
-        click.confirm(".env already exists. Overwrite?", abort=True)
-    copyfile(ENV_EXAMPLE, ENV_FILE)
-    click.echo("Created .env from .env.example")
-    # load and show summary
-    vals = dotenv_values(ENV_FILE)
-    click.echo("Environment variables:")
-    for k, v in vals.items():
-        click.echo(f"  {k}={v}")
+        if not click.confirm(".env exists. Overwrite?"):
+            click.echo("Aborted.")
+            return
+    shutil.copy(ENV_EXAMPLE, ENV_FILE)
+    click.echo(click.style("✅ Created .env from template", fg="green"))
 
 
 @cli.command()
-@click.option("--detach/--no-detach", default=True, help="Run docker-compose detached")
+@click.option("--detach/--no-detach", default=True, help="Run in background")
 def up(detach):
-    """Start the local environment with docker-compose."""
-    cmd = [DOCKER_COMPOSE_CMD, "up"]
+    """Start docker-compose stack."""
+    cmd = [DOCKER_COMPOSE, "up"]
     if detach:
         cmd.append("-d")
     run(cmd)
+    click.echo(click.style("🚀 Environment starting...", fg="cyan"))
 
 
 @cli.command()
 def status():
-    """Check the status of mock_api and MySQL."""
-    load_dotenv(ENV_FILE)
+    """Show container status and health."""
+    ensure_env()
+    run([DOCKER_COMPOSE, "ps"], check=False)
 
     # --- Mock API status ---
-    api_port = os.environ.get("MOCK_API_PORT", "6000")
-    api_url = f"http://localhost:{api_port}/health"
+    api_port = os.getenv("MOCK_API_PORT", "6000")
     try:
-        r = requests.get(api_url, timeout=3)
-        if r.status_code == 200 and r.json().get("status") == "ok":
-            click.echo(f"[OK] mock_api at {api_url}")
+        r = requests.get(f"http://localhost:{api_port}/health", timeout=3)
+        if r.ok:
+            click.echo(click.style("✅ mock_api healthy", fg="green"))
         else:
-            click.echo(
-                f"[WARN] mock_api unexpected response: {r.status_code} {r.text}")
-    except Exception as e:
-        click.echo(f"[ERR] Cannot reach mock_api at {api_url}: {e}")
+            click.echo(click.style("⚠ mock_api unhealthy", fg="yellow"))
+    except requests.RequestException:
+        click.echo(click.style("❌ mock_api unreachable", fg="red"))
 
     # --- MySQL status ---
     click.echo("Attempting mysql ping via docker-compose exec")
@@ -83,7 +85,7 @@ def status():
     db_host = os.environ.get("DB_HOST", "localhost")
 
     mysql_cmd = [
-        DOCKER_COMPOSE_CMD, "exec", "-T", "mysql",
+        DOCKER_COMPOSE, "exec", "-T", "mysql",
         "mysqladmin", "ping",
         "-h", db_host,
         "-u", db_user,
@@ -94,22 +96,21 @@ def status():
 
 @cli.command()
 def test():
-    """Run a smoke test: mock_api echo and mysql ping."""
-    load_dotenv(ENV_FILE)
+    """Run smoke test on mock_api and MySQL."""
+    ensure_env()
 
     # --- Mock API smoke test ---
-    api_port = os.environ.get("MOCK_API_PORT", "6000")
-    api_url = f"http://localhost:{api_port}/echo"
+    api_port = os.getenv("MOCK_API_PORT", "6000")
     payload = {"msg": "smoke-test"}
     try:
-        r = requests.post(api_url, json=payload, timeout=3)
-        if r.status_code == 200 and r.json().get("you_sent", {}).get("msg") == "smoke-test":
-            click.echo("[OK] mock_api echo test passed")
+        r = requests.post(
+            f"http://localhost:{api_port}/echo", json=payload, timeout=3)
+        if r.ok and r.json().get("you_sent", {}).get("msg") == "smoke-test":
+            click.echo(click.style("✅ mock_api echo passed", fg="green"))
         else:
-            click.echo(
-                f"[WARN] mock_api echo test unexpected response: {r.status_code} {r.text}")
-    except Exception as e:
-        click.echo(f"[ERR] mock_api echo failed: {e}")
+            click.echo(click.style("⚠ mock_api echo failed", fg="yellow"))
+    except requests.RequestException:
+        click.echo(click.style("❌ mock_api unreachable", fg="red"))
 
     # --- MySQL ping test ---
     click.echo("Attempting mysql ping via docker-compose exec")
@@ -117,9 +118,9 @@ def test():
     db_password = os.environ.get("DB_PASSWORD", "")
     db_host = os.environ.get("DB_HOST", "localhost")
 
-    # Pass password safely via -p flag (no space!)
+    # Pass password safely via -p flag
     mysql_cmd = [
-        DOCKER_COMPOSE_CMD, "exec", "-T", "mysql",
+        DOCKER_COMPOSE, "exec", "-T", "mysql",
         "mysqladmin", "ping",
         "-h", db_host,
         "-u", db_user,
@@ -129,27 +130,65 @@ def test():
 
 
 @cli.command()
+def doctor():
+    """Run host pre-flight checks."""
+    issues = []
+    # Docker
+    if shutil.which("docker") is None:
+        issues.append("Docker not found in PATH")
+    else:
+        try:
+            out = subprocess.check_output(
+                ["docker", "version", "--format", "{{.Server.Version}}"], text=True)
+            click.echo(f"🐳 Docker version {out.strip()}")
+        except Exception:
+            issues.append("Docker not responding")
+    # Python
+    if sys.version_info < (3, 8):
+        issues.append("Python 3.8+ required")
+    # Env
+    if not os.path.exists(ENV_FILE):
+        click.echo(click.style("ℹ .env not found (run init)", fg="yellow"))
+    if issues:
+        click.echo(click.style("❌ Issues detected:", fg="red"))
+        for i in issues:
+            click.echo("  - " + i)
+    else:
+        click.echo(click.style("✅ All checks passed", fg="green"))
+
+
+@cli.command()
+@click.argument("service", required=False)
+def logs(service):
+    """Tail docker logs."""
+    cmd = [DOCKER_COMPOSE, "logs", "-f"]
+    if service:
+        cmd.append(service)
+    try:
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        click.echo(click.style("\n🛑 log streaming stopped", fg="yellow"))
+
+
+@cli.command()
 def clean():
-    """Tear down the environment and remove volumes."""
-    run([DOCKER_COMPOSE_CMD, "down", "-v"])
+    """Stop containers and remove volumes."""
+    run([DOCKER_COMPOSE, "down", "-v"])
+    click.echo(click.style("🧹 Environment cleaned", fg="cyan"))
 
 
 @cli.command()
 @click.argument("name")
 def add_mock(name):
-    """Create a tiny mock service skeleton (not fully automated: convenience helper)."""
-    click.echo(f"Creating mock service scaffolding for: {name}")
+    """Scaffold a new mock service."""
     mdir = os.path.join(ROOT, name)
-    if os.path.exists(mdir):
-        click.echo("Directory already exists, aborting.")
-        return
-    os.makedirs(mdir)
+    os.makedirs(mdir, exist_ok=True)
     with open(os.path.join(mdir, "app.py"), "w") as f:
         f.write(
-            "# simple flask mock\nfrom flask import Flask, jsonify\napp = Flask(__name__)\n@app.route('/health')\ndef health():\n    return jsonify({'status':'ok'})\nif __name__=='__main__':\n    app.run(host='0.0.0.0', port=6000)\n")
+            "from flask import Flask,jsonify\napp=Flask(__name__)\n@app.route('/health')\ndef h():return jsonify({'status':'ok'})\napp.run(host='0.0.0.0',port=5000)")
     with open(os.path.join(mdir, "requirements.txt"), "w") as f:
         f.write("Flask\n")
-    click.echo("Scaffold created. Add to docker-compose.yml manually.")
+    click.echo(click.style(f"✨ Mock service scaffolded at {mdir}", fg="green"))
 
 
 if __name__ == "__main__":
